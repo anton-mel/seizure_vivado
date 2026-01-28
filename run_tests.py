@@ -6,6 +6,7 @@ import argparse
 import random
 import time
 from pathlib import Path
+import numpy as np
 
 from synthetic import generate_data_intan16, NUM_CHANNELS
 
@@ -35,6 +36,47 @@ CHUNK_BYTES = NUM_CHANNELS * SAMPLES_PER_CHUNK * SAMPLE_SIZE_BYTES
 MAX_EVENTS = 10000
 EVENT_BUFFER_SIZE = MAX_EVENTS * SAMPLE_SIZE_BYTES
 
+def load_intan_data(data_folder):
+    """
+    Load Intan data from a data folder (e.g., ~/Desktop/data/data_260128_165714).
+    Expects .rhd file in the folder.
+    
+    Returns:
+        numpy array of shape (num_channels * num_samples,) with uint16 ADC codes
+        (same format as generate_data_intan16)
+    """
+    data_folder = Path(data_folder)
+    rhd_files = list(data_folder.glob("*.rhd"))
+    
+    if not rhd_files:
+        raise FileNotFoundError(f"No .rhd file found in {data_folder}")
+    
+    rhd_file = rhd_files[0]  # Use first .rhd file found
+    print(f"[LOAD] Reading Intan data from {rhd_file}")
+    
+    try:
+        from read_rhd import read_rhd_file
+        result = read_rhd_file(str(rhd_file))
+        amplifier_data = result['amplifier_data']  # Shape: (num_channels, num_samples)
+        sample_rate = result['sample_rate']
+        
+        print(f"[LOAD] Loaded {amplifier_data.shape[0]} channels, {amplifier_data.shape[1]} samples, {sample_rate} Hz")
+        
+        # Convert from (num_channels, num_samples) to flat array format
+        # Same format as generate_data_intan16: [ch0_0, ch0_1, ..., ch0_N, ch1_0, ...]
+        num_channels, num_samples = amplifier_data.shape
+        all_data_16 = np.zeros(num_channels * num_samples, dtype=np.uint16)
+        
+        for ch in range(num_channels):
+            start_idx = ch * num_samples
+            end_idx = start_idx + num_samples
+            all_data_16[start_idx:end_idx] = amplifier_data[ch, :]
+        
+        return all_data_16, num_samples, sample_rate
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to read RHD file: {e}")
+
 def generate_synthetic_data_chunks(num_chunks=450, samples_per_channel=60000, seed=None, log_path=None):
     """Generate synthetic neural data chunks formatted for FPGA."""
     all_data_16 = generate_data_intan16(NUM_CHANNELS, samples_per_channel, 
@@ -62,6 +104,23 @@ def generate_synthetic_data_chunks(num_chunks=450, samples_per_channel=60000, se
                 chunk_bytes.extend(word32.to_bytes(4, byteorder='little'))
         chunks.append(bytes(chunk_bytes))
     return chunks, all_data_16
+
+def generate_chunks_from_data(all_data_16, num_channels, samples_per_channel):
+    """Generate FPGA chunks from loaded data."""
+    chunks = []
+    num_chunks = (samples_per_channel + SAMPLES_PER_CHUNK - 1) // SAMPLES_PER_CHUNK
+    
+    for chunk_id in range(num_chunks):
+        chunk_bytes = bytearray()
+        for ch in range(num_channels):
+            for sample_in_chunk in range(SAMPLES_PER_CHUNK):
+                sample_idx = chunk_id * SAMPLES_PER_CHUNK + sample_in_chunk
+                idx = ch * samples_per_channel + sample_idx
+                code16 = int(all_data_16[idx]) if idx < len(all_data_16) else 32768
+                word32 = (ch << 16) | code16
+                chunk_bytes.extend(word32.to_bytes(4, byteorder='little'))
+        chunks.append(bytes(chunk_bytes))
+    return chunks
 
 def ensure_multiple_of_16(data: bytes) -> bytes:
     """Ensure padded by multiple of 16 bytes (required for PipeIn)."""
@@ -197,10 +256,13 @@ def main():
     p = argparse.ArgumentParser(description="Test seizure detection on Opal Kelly FPGA")
     # FPGA Configuration
     p.add_argument("--bitfile", "-f", type=str, default=None, help="Path to .bit file")
+    # Data Source Configuration
+    p.add_argument("--data-folder", type=str, default=None, 
+                   help="Path to Intan data folder (e.g., ~/Desktop/data/data_260128_165714). If not provided, uses synthetic data.")
     # Synthetic Data Configuration
-    p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument("--chunks", type=int, default=469, help="Number of chunks (default: 469)")
-    p.add_argument("--samples", type=int, default=60000, help="Samples per channel (default: 60000)")
+    p.add_argument("--seed", type=int, default=None, help="Random seed (for synthetic data only)")
+    p.add_argument("--chunks", type=int, default=None, help="Number of chunks (auto-calculated from data if --data-folder provided)")
+    p.add_argument("--samples", type=int, default=60000, help="Samples per channel (for synthetic data only, default: 60000)")
     # Datapath Configuration Parameters
     p.add_argument("--threshold", type=int, default=150000, help="NEO threshold (default: 150000)")
     p.add_argument("--window-timeout", type=int, default=300, help="Window timeout in samples (default: 300)")
@@ -233,10 +295,36 @@ def main():
         log_msg("=" * 70)
 
         
-        # Generate data
-        log_msg(f"\n[DATA] Generating {args.chunks} chunks...")
-        chunks, raw_data = generate_synthetic_data_chunks(args.chunks, args.samples, args.seed, log_path=args.log)
-        log_msg(f"[DATA] Generated {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} bytes)")
+        # Load or generate data
+        if args.data_folder:
+            # Load real Intan data
+            log_msg(f"\n[DATA] Loading Intan data from {args.data_folder}...")
+            all_data_16, samples_per_channel, sample_rate = load_intan_data(args.data_folder)
+            
+            # Calculate chunks from data
+            num_chunks = (samples_per_channel + SAMPLES_PER_CHUNK - 1) // SAMPLES_PER_CHUNK
+            if args.chunks:
+                num_chunks = min(num_chunks, args.chunks)  # Limit if specified
+            
+            chunks = generate_chunks_from_data(all_data_16, NUM_CHANNELS, samples_per_channel)
+            chunks = chunks[:num_chunks]  # Limit to requested chunks
+            
+            # Save raw data for visualization
+            inputs_dir = Path("inputs")
+            inputs_dir.mkdir(exist_ok=True)
+            log_base = Path(args.log).stem
+            import numpy as np
+            raw_data_file = inputs_dir / f"{log_base}_raw_data.npy"
+            np.save(raw_data_file, all_data_16)
+            log_msg(f"[DATA] Loaded {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} bytes)")
+            log_msg(f"[DATA] Sample rate: {sample_rate} Hz, Samples per channel: {samples_per_channel}")
+        else:
+            # Generate synthetic data
+            num_chunks = args.chunks if args.chunks else 450
+            log_msg(f"\n[DATA] Generating {num_chunks} chunks...")
+            chunks, all_data_16 = generate_synthetic_data_chunks(num_chunks, args.samples, args.seed, log_path=args.log)
+            samples_per_channel = args.samples
+            log_msg(f"[DATA] Generated {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} bytes)")
         
         # Initialize device
         dev = ok.okCFrontPanel()
@@ -358,7 +446,8 @@ def main():
         
         # Generate plots
         log_msg(f"\n[PLOT] Generating plots from raw input data...")
-        plot_raw_data(log_base, args.chunks)
+        num_chunks_plot = len(chunks)
+        plot_raw_data(log_base, num_chunks_plot)
     
     print(f"\nDONE! Log written to {args.log}")
 
