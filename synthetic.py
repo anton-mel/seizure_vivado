@@ -104,7 +104,7 @@ class NeuralSynthSource:
             return 0.0
     
     def _seizure_voltage(self):
-        """Generate seizure voltage - high amplitude, low frequency bursts"""
+        """Generate seizure voltage: high amplitude, low frequency bursts"""
         if self.seizure_start_time_ms is None:
             # Random chance to start a seizure
             if random.random() < self.seizure_probability * self.t_step_ms / 1000.0:
@@ -144,6 +144,9 @@ class NeuralSynthSource:
         result += self._lfp_voltage()
         
         # Add seizure activity if enabled
+        # ------------------------------------------------------------
+        # Seizures are injected as high-amplitude (500 µV), low-frequency (2.5 Hz) sine waves
+        # that last for 6 seconds. They are randomly triggered with 1% probability per sec/ch.
         if self.enable_seizures:
             result += self._seizure_voltage()
         

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-""" Run seizure detection test on Opal Kelly board using synthetic neural data """
-
 import os
 import sys
 import argparse
@@ -9,320 +7,360 @@ import random
 import time
 from pathlib import Path
 
-# Add synthetic data generator to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from synthetic import generate_data_intan16, NUM_CHANNELS
 
-# Add Opal Kelly FrontPanel Python API to path (default, change if updated)
-# Detect if running in WSL and use appropriate path format
-if os.path.exists("/proc/version") and "microsoft" in open("/proc/version").read().lower():
-    # Running in WSL
-    OK_PYTHON_API = "/mnt/c/Program Files/Opal Kelly/FrontPanelUSB/API/Python/x64"
-    OK_DLL_DIR = "/mnt/c/Program Files/Opal Kelly/FrontPanelUSB/API/lib/x64"
+# -------------------------------------------------------------------------------------------------
+# Import OK module (Copied over from Intan RHX Repository to support MacOS)
+# -------------------------------------------------------------------------------------------------
+ok_module_path = Path(__file__).resolve().parent / "ok.py"
+if ok_module_path.exists():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ok", ok_module_path)
+    ok = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ok)
 else:
-    # Running in Windows
-    OK_PYTHON_API = r"C:\Program Files\Opal Kelly\FrontPanelUSB\API\Python\x64"
-    OK_DLL_DIR = r"C:\Program Files\Opal Kelly\FrontPanelUSB\API\lib\x64"
+    raise ImportError("ok.py not found")
 
-if os.path.exists(OK_PYTHON_API) and OK_PYTHON_API not in sys.path:
-    sys.path.insert(0, OK_PYTHON_API)
+# -------------------------------------------------------------------------------------------------
+# Constants
+# -------------------------------------------------------------------------------------------------
+PIPE_IN_ADDR = 0x80
+PIPE_OUT_ADDR = 0xA0
+WIREIN_CTRL = 0x00
+WIREIN_TS_LO, WIREIN_TS_HI = 0x01, 0x02
+WIREIN_THRESHOLD, WIREIN_WINDOW_TIMEOUT, WIREIN_TRANSITION_COUNT = 0x03, 0x04, 0x05
+SAMPLES_PER_CHUNK = 128 # const by Intan SDK
+SAMPLE_SIZE_BYTES = 4 # const by Intan SDK
+CHUNK_BYTES = NUM_CHANNELS * SAMPLES_PER_CHUNK * SAMPLE_SIZE_BYTES
+MAX_EVENTS = 10000
+EVENT_BUFFER_SIZE = MAX_EVENTS * SAMPLE_SIZE_BYTES
 
-# Add DLL directory to Windows DLL search path (Python 3.8+)
-if os.path.exists(OK_DLL_DIR):
-    if hasattr(os, 'add_dll_directory'):
-        os.add_dll_directory(OK_DLL_DIR)
-    else:
-        # Fallback for older Python versions: add to PATH
-        dll_path = os.environ.get('PATH', '')
-        if OK_DLL_DIR not in dll_path:
-            os.environ['PATH'] = OK_DLL_DIR + os.pathsep + dll_path
-
-import ok
-
-PIPE_IN_ADDR = 0x80   # matches okPipeIn in datapath endpoint address
-PIPE_OUT_ADDR = 0xA0  # matches okPipeOut in datapath endpoint address
-WIREIN_CTRL = 0x00    # reset(31)
-WIREIN_TS_LO = 0x01   # timestamp lower 32 bits
-WIREIN_TS_HI = 0x02   # timestamp upper 32 bits
-WIREOUT_TS_LO = 0x20  # timestamp lower 32 bits (WireOut range 0x20-0x3F)
-WIREOUT_TS_HI = 0x21  # timestamp upper 32 bits
-
-# Data format: 32 channels × 128 samples per chunk = 4096 samples = 16384 bytes per chunk
-# Each sample is packed into a 32-bit word: [21:16]=channel_id, [15:0]=sample
-SAMPLES_PER_CHUNK = 128  # samples per channel per chunk
-CHUNK_BYTES = NUM_CHANNELS * SAMPLES_PER_CHUNK * 4  # 32 * 128 * 4 = 16384 bytes
-
-HERE = Path(__file__).resolve().parent
-
-def ensure_multiple_of_16(data: bytes) -> bytes:
-    """Ensure data length is multiple of 16 bytes (required for PipeIn)"""
-    rem = len(data) % 16
-    if rem == 0:
-        return data
-    pad = 16 - rem
-    return data + bytes(pad)
-
-def generate_synthetic_data_chunks(num_chunks=450, samples_per_channel=60000, seed=None):
-    """
-    Generate synthetic neural data and format into chunks for FPGA.
+def generate_synthetic_data_chunks(num_chunks=450, samples_per_channel=60000, seed=None, log_path=None):
+    """Generate synthetic neural data chunks formatted for FPGA."""
+    all_data_16 = generate_data_intan16(NUM_CHANNELS, samples_per_channel, 
+                                        sample_rate=1000.0, enable_seizures=True)
     
-    Returns:
-        List of byte arrays, each representing one chunk formatted for First.sv.
-        Format: Each 32-bit word contains:
-            [15:0]  : 16-bit sample (ADC code)
-            [21:16] : 6-bit channel_id (0-31)
-            [31:22] : unused (set to 0)
-        Data is interleaved: [ch0_sample0, ch0_sample1, ..., ch0_sample127, ch1_sample0, ..., ch31_sample127]
-    """
-    # Generate data for all 32 channels
-    # This creates a flat array: [ch0_0, ..., ch0_59999, ch1_0, ..., ch31_59999]
-    all_data_16 = generate_data_intan16(
-        NUM_CHANNELS,
-        samples_per_channel,
-        sample_rate=1000.0,
-        enable_seizures=True,
-    )
+    # Save raw data for visualization
+    if log_path:
+        inputs_dir = Path("inputs")
+        inputs_dir.mkdir(exist_ok=True)
+        log_base = Path(log_path).stem
+        import numpy as np
+        raw_data_file = inputs_dir / f"{log_base}_raw_data.npy"
+        np.save(raw_data_file, all_data_16)
+        print(f"[SAVE] Raw data saved to {raw_data_file} ({len(all_data_16)} samples, shape: {all_data_16.shape})")
     
     chunks = []
     for chunk_id in range(num_chunks):
         chunk_bytes = bytearray()
-        
-        # For each channel, extract 128 samples starting at chunk_id * 128
         for ch in range(NUM_CHANNELS):
             for sample_in_chunk in range(SAMPLES_PER_CHUNK):
                 sample_idx = chunk_id * SAMPLES_PER_CHUNK + sample_in_chunk
                 idx = ch * samples_per_channel + sample_idx
-                
-                if idx < len(all_data_16):
-                    code16 = int(all_data_16[idx])
-                else:
-                    # Pad with mid-point value if we run out of data
-                    code16 = 32768
-                
-                # Format as 32-bit word: [31:22]=0, [21:16]=channel_id, [15:0]=sample
+                code16 = int(all_data_16[idx]) if idx < len(all_data_16) else 32768
                 word32 = (ch << 16) | code16
-                
-                # Convert to little-endian bytes (4 bytes per word)
                 chunk_bytes.extend(word32.to_bytes(4, byteorder='little'))
-        
         chunks.append(bytes(chunk_bytes))
-    
-    return chunks
+    return chunks, all_data_16
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Stream synthetic neural data to Opal Kelly FPGA and read seizure detection events."
-    )
-    p.add_argument("--bitfile", "-f", type=str, default=None,
-                   help="Path to .bit file (optional; if omitted, won't reprogram device)")
-    p.add_argument("--seed", type=int, default=None,
-                   help="Random seed for reproducible synthetic data")
-    p.add_argument("--chunks", type=int, default=450,
-                   help="Number of chunks to send (default: 450 = ~57.6 seconds at 1kHz)")
-    p.add_argument("--samples", type=int, default=60000,
-                   help="Samples per channel to generate (default: 60000 = 60 seconds at 1kHz)")
-    p.add_argument("--log", type=str, default=str(HERE / "run_halo_log.txt"),
-                   help="Log file path (overwritten each run)")
-    return p.parse_args()
+def ensure_multiple_of_16(data: bytes) -> bytes:
+    """Ensure padded by multiple of 16 bytes (required for PipeIn)."""
+    rem = len(data) % 16
+    return data if rem == 0 else data + bytes(16 - rem)
+
+def parse_seizure_events(output_file):
+    """Parse START/END events from outputs file."""
+    seizures = []
+    if not output_file.exists():
+        return seizures
+    
+    with open(output_file, 'r') as f:
+        lines = f.readlines()
+    
+    start_time = None
+    for line in lines:
+        if '01 (START)' in line:
+            # Extract timestamp: "01 (START) | 0000000000000000108 | ..."
+            parts = line.split('|')
+            if len(parts) >= 2:
+                try:
+                    start_time = int(parts[1].strip())
+                except ValueError:
+                    continue
+        elif '02 (END  )' in line and start_time is not None:
+            # Extract timestamp: "02 (END  ) | 0000000000000001444 | ..."
+            parts = line.split('|')
+            if len(parts) >= 2:
+                try:
+                    end_time = int(parts[1].strip())
+                    seizures.append((start_time, end_time))
+                    start_time = None
+                except ValueError:
+                    continue
+    
+    # Handle ongoing seizure (START without END)
+    if start_time is not None:
+        seizures.append((start_time, None))
+    
+    return seizures
+
+def plot_raw_data(log_base, num_chunks):
+    """Generate plots with seizure regions marked."""
+    try:
+        import numpy as np
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PLOT] Skipping plots - matplotlib not available")
+        return
+    
+    inputs_dir = Path("inputs")
+    outputs_dir = Path("outputs")
+    raw_data_file = inputs_dir / f"{log_base}_raw_data.npy"
+    
+    if not raw_data_file.exists():
+        print(f"[PLOT] Raw data file not found: {raw_data_file}")
+        return
+    
+    raw_data = np.load(raw_data_file)
+    
+    seizures_dir = Path("seizures")
+    seizures_dir.mkdir(exist_ok=True)
+    
+    samples_sent = num_chunks * SAMPLES_PER_CHUNK
+    duration_ms = samples_sent  # At 1 kHz: samples = milliseconds
+    
+    # Plot all 32 channels in blocks of 4, arranged in 3x3 grid
+    num_blocks = (NUM_CHANNELS + 3) // 4  # 8 blocks for 32 channels
+    fig = plt.figure(figsize=(20, 15))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    for block_idx in range(num_blocks):
+        row = block_idx // 3
+        col = block_idx % 3
+        
+        # Get channels for this block (4 channels per block)
+        start_ch = block_idx * 4
+        end_ch = min(start_ch + 4, NUM_CHANNELS)
+        channels_in_block = list(range(start_ch, end_ch))
+        
+        # Create subplot grid for this block (4 channels stacked vertically)
+        block_gs = gs[row, col].subgridspec(4, 1, hspace=0.1)
+        
+        for ch_idx, ch in enumerate(channels_in_block):
+            # Create subplot for this channel
+            ax_ch = fig.add_subplot(block_gs[ch_idx, 0])
+            
+            # Calculate start index for this channel
+            channel_start_idx = ch * len(raw_data) // NUM_CHANNELS
+            # Only plot the samples that were actually sent
+            channel_data = raw_data[channel_start_idx:channel_start_idx + samples_sent]
+            
+            # Time in milliseconds (1 sample = 1ms at 1kHz)
+            time_ms = np.arange(len(channel_data))
+            
+            # Plot the raw data
+            ax_ch.plot(time_ms, channel_data, linewidth=0.3, alpha=0.7, color='blue')
+            
+            # Load and mark seizure regions
+            output_file = outputs_dir / f"{log_base}_ch{ch}.txt"
+            seizures = parse_seizure_events(output_file)
+            
+            # Draw semi-transparent rectangles for each seizure
+            for start_ms, end_ms in seizures:
+                if end_ms is None:
+                    # Ongoing seizure - extend to end of plot
+                    end_ms = duration_ms
+                # Only shade if within plot range
+                if start_ms < duration_ms:
+                    end_ms_plot = min(end_ms, duration_ms)
+                    ax_ch.axvspan(start_ms, end_ms_plot, 
+                                 alpha=0.3, color='red', label='Seizure' if start_ms == seizures[0][0] else '')
+            
+            ax_ch.set_xlim(0, duration_ms)
+            ax_ch.set_title(f'Channel {ch}', fontsize=9)
+            if ch_idx == len(channels_in_block) - 1:  # Bottom channel in block
+                ax_ch.set_xlabel('Time (ms)', fontsize=8)
+            else:
+                ax_ch.set_xticklabels([])
+            ax_ch.set_ylabel('ADC', fontsize=7)
+            ax_ch.grid(True, alpha=0.3)
+            if seizures:
+                ax_ch.legend(loc='upper right', fontsize=6)
+    
+    plt.tight_layout()
+    plot_file = seizures_dir / f"{log_base}_raw_inputs.png"
+    plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[PLOT] Saved plot to {plot_file}")
 
 def main():
-    args = parse_args()
+    p = argparse.ArgumentParser(description="Test seizure detection on Opal Kelly FPGA")
+    # FPGA Configuration
+    p.add_argument("--bitfile", "-f", type=str, default=None, help="Path to .bit file")
+    # Synthetic Data Configuration
+    p.add_argument("--seed", type=int, default=None, help="Random seed")
+    p.add_argument("--chunks", type=int, default=469, help="Number of chunks (default: 469)")
+    p.add_argument("--samples", type=int, default=60000, help="Samples per channel (default: 60000)")
+    # Datapath Configuration Parameters
+    p.add_argument("--threshold", type=int, default=150000, help="NEO threshold (default: 150000)")
+    p.add_argument("--window-timeout", type=int, default=300, help="Window timeout in samples (default: 300)")
+    p.add_argument("--transition-count", type=int, default=50, help="Detections needed to start seizure (default: 50)")
+    # Logging
+    p.add_argument("--log", type=str, default="run_halo_log.txt", help="Log file path")
+    args = p.parse_args()
     
     if args.seed is not None:
         random.seed(args.seed)
-        # Also seed numpy if available (for synthetic.py)
         try:
             import numpy as np
             np.random.seed(args.seed)
         except ImportError:
             pass
     
-    with open(args.log, "w", encoding="utf-8") as lf:
-        def log(msg: str):
-            print(msg)
-            lf.write(msg + "\n")
-            lf.flush()
+    # Clean outputs
+    import shutil
+    for dir_name in ["outputs", "inputs", "seizures"]:
+        dir_path = Path(dir_name)
+        if dir_path.exists():
+            shutil.rmtree(dir_path)
+        dir_path.mkdir(exist_ok=True)
+    
+    with open(args.log, "w", encoding="utf-8") as log:
+        def log_msg(msg): print(msg); log.write(msg + "\n"); log.flush()
         
-        log("=" * 70)
-        log("Opal Kelly Seizure Detection Test with Synthetic Neural Data")
-        log("=" * 70)
+        log_msg("=" * 70)
+        log_msg("Opal Kelly Seizure Detection Test")
+        log_msg("=" * 70)
+
         
-        # Generate synthetic data chunks
-        log(f"\nGenerating {args.chunks} chunks of synthetic neural data...")
-        log(f"  Samples per channel: {args.samples}")
-        log(f"  Samples per chunk per channel: {SAMPLES_PER_CHUNK}")
-        log(f"  Bytes per chunk: {CHUNK_BYTES} (32-bit words: {NUM_CHANNELS * SAMPLES_PER_CHUNK} words)")
+        # Generate data
+        log_msg(f"\n[DATA] Generating {args.chunks} chunks...")
+        chunks, raw_data = generate_synthetic_data_chunks(args.chunks, args.samples, args.seed, log_path=args.log)
+        log_msg(f"[DATA] Generated {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} bytes)")
         
-        chunks = generate_synthetic_data_chunks(
-            num_chunks=args.chunks,
-            samples_per_channel=args.samples,
-            seed=args.seed
-        )
-        log(f"Generated {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} total bytes)")
-        
-        # Initialize Opal Kelly device
+        # Initialize device
         dev = ok.okCFrontPanel()
-        
-        # Open first available device
         count = dev.GetDeviceCount()
-        log(f"\nDevice count: {count}")
-        
         if count <= 0:
-            log("ERROR: No Opal Kelly devices found.")
-            print(f"FAILED - see log: {args.log}")
+            log_msg("ERROR: No Opal Kelly devices found.")
             sys.exit(1)
         
         serial = dev.GetDeviceListSerial(0)
         rc = dev.OpenBySerial(serial)
-        log(f"OpenBySerial({serial}) rc={rc}")
-        
+        log_msg(f"[CONNECT] OpenBySerial({serial}) rc={rc}")
         if rc != ok.okCFrontPanel.NoError:
-            log(f"ERROR: OpenBySerial failed: {ok.okCFrontPanel.GetErrorString(rc)}")
-            print(f"FAILED - see log: {args.log}")
+            log_msg(f"ERROR: OpenBySerial failed")
             sys.exit(1)
         
-        # Optionally program bitfile
+        # Configure FPGA
         if args.bitfile:
-            bit = os.path.abspath(args.bitfile)
-            log(f"\nConfiguring FPGA with {bit} ...")
-            rc = dev.ConfigureFPGA(bit)
-            log(f"ConfigureFPGA rc={rc}")
-            
+            rc = dev.ConfigureFPGA(os.path.abspath(args.bitfile))
+            log_msg(f"[CONFIGURE] ConfigureFPGA rc={rc}")
             if rc != ok.okCFrontPanel.NoError:
-                log(f"ERROR: ConfigureFPGA failed: {ok.okCFrontPanel.GetErrorString(rc)}")
-                print(f"FAILED - see log: {args.log}")
+                log_msg("ERROR: ConfigureFPGA failed")
                 sys.exit(1)
-            log("FPGA configured successfully")
-        else:
-            log("\nSkipping FPGA configuration (no --bitfile specified)")
         
-        # Apply control wires: pulse reset and set timestamp
-        ctrl_reset = 0x8000_0000
-        ctrl_release = 0x0000_0000
+        # Set parameters
+        dev.SetWireInValue(WIREIN_THRESHOLD, args.threshold & 0xFFFFFFFF, 0xFFFFFFFF)
+        dev.SetWireInValue(WIREIN_WINDOW_TIMEOUT, args.window_timeout & 0xFFFFFFFF, 0xFFFFFFFF)
+        dev.SetWireInValue(WIREIN_TRANSITION_COUNT, args.transition_count & 0xFFFFFFFF, 0xFFFFFFFF)
+        
+        # Reset and timestamp
         ts = random.getrandbits(64) if args.seed is None else args.seed
-        
         dev.SetWireInValue(WIREIN_TS_LO, ts & 0xFFFFFFFF, 0xFFFFFFFF)
         dev.SetWireInValue(WIREIN_TS_HI, (ts >> 32) & 0xFFFFFFFF, 0xFFFFFFFF)
+        dev.SetWireInValue(WIREIN_CTRL, 0x8000_0000, 0xFFFFFFFF)
+        dev.UpdateWireIns()
+        dev.SetWireInValue(WIREIN_CTRL, 0x0000_0000, 0xFFFFFFFF)
+        dev.UpdateWireIns()
         
-        # Pulse reset high
-        dev.SetWireInValue(WIREIN_CTRL, ctrl_reset, 0xFFFFFFFF)
-        rc = dev.UpdateWireIns()
-        log(f"\nUpdateWireIns (reset assert, ts set) rc={rc}, ts=0x{ts:016X}")
-        
-        if rc != ok.okCFrontPanel.NoError:
-            log(f"ERROR: UpdateWireIns failed: {ok.okCFrontPanel.GetErrorString(rc)}")
-        
-        # Release reset
-        dev.SetWireInValue(WIREIN_CTRL, ctrl_release, 0xFFFFFFFF)
-        rc = dev.UpdateWireIns()
-        log(f"UpdateWireIns (reset deassert) rc={rc}")
-        
-        if rc != ok.okCFrontPanel.NoError:
-            log(f"ERROR: UpdateWireIns failed: {ok.okCFrontPanel.GetErrorString(rc)}")
-        
-        # Send chunks to PipeIn
-        log(f"\nSending {len(chunks)} chunks to PipeIn 0x{PIPE_IN_ADDR:02X}...")
-        total_bytes_sent = 0
-        
+        # Send data
+        log_msg(f"\n[SEND] Sending {len(chunks)} chunks to PipeIn 0x{PIPE_IN_ADDR:02X}...")
         for chunk_idx, chunk_data in enumerate(chunks):
-            # Ensure chunk is multiple of 16 bytes
-            padded_chunk = ensure_multiple_of_16(chunk_data)
-            # Convert to bytearray (required by Opal Kelly API)
-            padded_chunk = bytearray(padded_chunk)
-            
-            status = dev.WriteToPipeIn(PIPE_IN_ADDR, padded_chunk)
-            
+            padded = ensure_multiple_of_16(chunk_data)
+            status = dev.WriteToPipeIn(PIPE_IN_ADDR, bytearray(padded))
             if status < 0:
-                log(f"ERROR: WriteToPipeIn failed for chunk {chunk_idx}: "
-                    f"{ok.okCFrontPanel.GetErrorString(dev.GetLastError())}")
-                print(f"FAILED - see log: {args.log}")
+                log_msg(f"ERROR: WriteToPipeIn failed for chunk {chunk_idx}")
                 sys.exit(1)
-            
-            total_bytes_sent += len(padded_chunk)
-            
             if (chunk_idx + 1) % 50 == 0:
-                log(f"  Sent {chunk_idx + 1}/{len(chunks)} chunks ({total_bytes_sent} bytes)")
+                log_msg(f"  Sent {chunk_idx + 1}/{len(chunks)} chunks")
+        log_msg(f"[DONE] Sent all {len(chunks)} chunks")
         
-        log(f"Successfully sent all {len(chunks)} chunks ({total_bytes_sent} total bytes)")
+        time.sleep(0.5)
         
-        # Wait a bit for processing
-        time.sleep(0.1)
+        # Read events (ToDo: In Parallel)
+        log_msg(f"\n[READ] Reading events from PipeOut 0x{PIPE_OUT_ADDR:02X}...")
+        out = dev.ReadFromPipeOut(PIPE_OUT_ADDR, EVENT_BUFFER_SIZE)
+        bytes_read = len(out)
+        log_msg(f"[DONE] Read {bytes_read} bytes ({bytes_read // 4} words)")
         
-        # Read back detection events from PipeOut
-        # Allocate buffer large enough for many events (each event is 4 bytes)
-        max_events = 10000
-        event_buffer_size = max_events * 4
+        # Parse events: [31:30]=event_code, [29:25]=channel_id, [24:0]=timestamp
+        words = [int.from_bytes(out[i:i+4], byteorder="little") 
+                 for i in range(0, bytes_read, 4) if i + 4 <= bytes_read]
         
-        log(f"\nReading detection events from PipeOut 0x{PIPE_OUT_ADDR:02X}...")
-        buf = bytearray(event_buffer_size)
-        status = dev.ReadFromPipeOut(PIPE_OUT_ADDR, buf)
+        # Group events by channel
+        events_by_channel = {ch: [] for ch in range(32)}
+        starts, ends, idle = 0, 0, 0
         
-        if status < 0:
-            log(f"ERROR: ReadFromPipeOut failed: {ok.okCFrontPanel.GetErrorString(dev.GetLastError())}")
-            print(f"FAILED - see log: {args.log}")
-            sys.exit(1)
-        
-        # status is the number of bytes actually read
-        out = bytes(buf[:max(status, 0)])
-        
-        # Read timestamp out
-        rc = dev.UpdateWireOuts()
-        ts_out_lo = dev.GetWireOutValue(WIREOUT_TS_LO)
-        ts_out_hi = dev.GetWireOutValue(WIREOUT_TS_HI)
-        ts_out = (ts_out_hi << 32) | ts_out_lo
-        
-        log(f"Successfully read {len(out)} bytes from PipeOut")
-        log(f"Config timestamp latched: 0x{ts_out:016X} "
-            f"(low=0x{ts_out_lo:08X}, high=0x{ts_out_hi:08X})")
-        
-        # Parse events
-        # Each 32-bit word encodes (from First.sv):
-        #   [31]   : output_event (1 = seizure start, 0 = seizure end)
-        #   [30:26]: channel_id (0-31, 5 bits)
-        #   [25:0] : lower 26 bits of datapath output_timestamp
-        
-        words = [
-            int.from_bytes(out[i:i+4], byteorder="little")
-            for i in range(0, len(out), 4)
-            if i + 4 <= len(out)
-        ]
-        
-        log(f"\n" + "=" * 70)
-        log(f"Index, EventBit, Channel, Timestamp26Hex, RawWordHex")
-        log(f"(EventBit: 1 = seizure start, 0 = seizure end; Timestamp26Hex = lower 26 bits of datapath timestamp)")
-        
-        seizure_starts = 0
-        seizure_ends = 0
-        
-        for idx, w in enumerate(words):
-            # Extract fields according to First.sv format
-            event_bit = (w >> 31) & 0x1
-            channel_id = (w >> 26) & 0x1F  # bits [30:26]
-            timestamp26 = w & 0x03FF_FFFF  # bits [25:0], 26 bits
+        for w in words:
+            event_code = (w >> 30) & 0x3
+            channel_id = (w >> 25) & 0x1F
+            timestamp25 = w & 0x01FF_FFFF
             
-            event_type = "START" if event_bit else "END"
-            log(f"{idx:04d}, {event_bit}, {channel_id}, 0x{timestamp26:08X}, 0x{w:08X}")
-            
-            if event_bit:
-                seizure_starts += 1
+            if event_code == 0x1:
+                event_str, starts = "START", starts + 1
+            elif event_code == 0x2:
+                event_str, ends = "END  ", ends + 1
             else:
-                seizure_ends += 1
+                event_str, idle = "IDLE ", idle + 1
+            
+            events_by_channel[channel_id].append((event_code, event_str, timestamp25, w))
         
-        log("=" * 70)
-        log(f"\nTotal events decoded: {len(words)}")
-        log(f"Seizure starts: {seizure_starts}")
-        log(f"Seizure ends:   {seizure_ends}")
-        log("=" * 70)
+        # Write per-channel
+        log_base = Path(args.log).stem
+        outputs_dir = Path("outputs")
+        outputs_dir.mkdir(exist_ok=True)
+        
+        log_msg(f"\n" + "=" * 70)
+        log_msg("OUTPUT")
+        log_msg("=" * 70)
+        
+        for ch in range(32):
+            if events_by_channel[ch]:
+                # Count seizures
+                seizure_count = sum(1 for event_code, _, _, _ in events_by_channel[ch] if event_code == 0x1)
+                
+                # Create logs
+                ch_file = outputs_dir / f"{log_base}_ch{ch}.txt"
+                with open(ch_file, "w", encoding="utf-8") as f:
+                    f.write(f"Channel {ch} - Seizure Detection Events\n")
+                    f.write("=" * 70 + "\n")
+                    f.write("EventCode | Timestamp | RawWordHex\n")
+                    f.write("-" * 70 + "\n")
+                    for event_code, event_str, timestamp25, w in events_by_channel[ch]:
+                        f.write(f"{event_code:02d} ({event_str}) | {timestamp25:019d} | 0x{w:08X}\n")
+                    f.write("=" * 70 + "\n")
+                    f.write(f"Total seizures: {seizure_count}\n")
+                    f.write(f"Total events: {len(events_by_channel[ch])}\n")
+                log_msg(f"  Channel {ch:2d}: {seizure_count:3d} seizures ({len(events_by_channel[ch]):5d} events) -> {ch_file}")
+        
+        # Summary in main log
+        log_msg("=" * 70)
+        log_msg(f"SUMMARY: {len(words)} words, {starts} starts, {ends} ends, {idle} idle")
+        log_msg("=" * 70)
         
         if len(words) == 0:
-            log("\nWARNING: No detection events received. This could mean:")
-            log("  1. No seizures were detected in the synthetic data")
-            log("  2. Threshold is too high (check THRESHOLD_VALUE in datapath.sv)")
-            log("  3. FPGA is not processing data correctly")
+            log_msg("\nWARNING: No events received")
+        elif starts == 0 and ends == 0:
+            log_msg("\nWARNING: All events are idle")
         else:
-            log(f"\nSUCCESS: Received {len(words)} detection events")
+            log_msg(f"\nSUCCESS: {starts} starts, {ends} ends")
+        
+        # Generate plots
+        log_msg(f"\n[PLOT] Generating plots from raw input data...")
+        plot_raw_data(log_base, args.chunks)
     
-    print(f"\nDONE - log written to {args.log}")
+    print(f"\nDONE! Log written to {args.log}")
 
 if __name__ == "__main__":
     main()
