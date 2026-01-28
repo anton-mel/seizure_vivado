@@ -3,7 +3,7 @@
 Run this command to generate 1 minute of synthetic data with seizures:
 
 ```bash 
-python3 run_tests.py --bitfile new.bit --chunks 469 --threshold 120000 --window-timeout 200 --transition-count 30 --seed 123 --log test_output.txt
+python3 run_tests.py --bitfile new.bit --log test_output.txt
 ```
 
 ## Pipeline
