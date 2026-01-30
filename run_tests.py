@@ -41,17 +41,23 @@ def load_intan_data(data_folder):
     Load Intan data from a data folder (e.g., ~/Desktop/data/data_260128_165714).
     Expects .rhd file in the folder.
     
+    NOTE: RHD channels 0-1 are typically reference/ground channels (low variance).
+    We skip these and map RHD channels 2-31 to FPGA channels 0-29.
+    
     Returns:
         numpy array of shape (num_channels * num_samples,) with uint16 ADC codes
         (same format as generate_data_intan16)
+        num_channels will be 30 (RHD channels 2-31 mapped to FPGA channels 0-29)
     """
     data_folder = Path(data_folder)
-    rhd_files = list(data_folder.glob("*.rhd"))
+    rhd_files = sorted(list(data_folder.glob("*.rhd")))  # Sort for consistent ordering
     
     if not rhd_files:
         raise FileNotFoundError(f"No .rhd file found in {data_folder}")
     
-    rhd_file = rhd_files[0]  # Use first .rhd file found
+    # Use the RHD file with the earliest timestamp in filename (first alphabetically)
+    # This prefers files like data_260130_150430.rhd over data_260130_150530.rhd
+    rhd_file = min(rhd_files, key=lambda p: p.stem) if len(rhd_files) > 1 else rhd_files[0]
     print(f"[LOAD] Reading Intan data from {rhd_file}")
     
     try:
@@ -60,17 +66,30 @@ def load_intan_data(data_folder):
         amplifier_data = result['amplifier_data']  # Shape: (num_channels, num_samples)
         sample_rate = result['sample_rate']
         
-        print(f"[LOAD] Loaded {amplifier_data.shape[0]} channels, {amplifier_data.shape[1]} samples, {sample_rate} Hz")
+        print(f"[LOAD] Loaded {amplifier_data.shape[0]} channels from RHD file, {amplifier_data.shape[1]} samples, {sample_rate} Hz")
         
-        # Convert from (num_channels, num_samples) to flat array format
+        # Skip RHD channels 0-1 (reference/ground) and map RHD channels 2-31 to FPGA channels 0-29
+        # RHD channels 0-1 typically have low variance and are not neural signals
+        num_rhd_channels, num_samples = amplifier_data.shape
+        if num_rhd_channels < 32:
+            raise ValueError(f"Expected at least 32 channels in RHD file, got {num_rhd_channels}")
+        
+        # Use channels 2-31 (30 channels total)
+        data_channels = amplifier_data[2:32, :]  # Shape: (30, num_samples)
+        num_fpga_channels = 30
+        
+        print(f"[LOAD] Skipping RHD channels 0-1 (reference/ground), using RHD channels 2-31 -> FPGA channels 0-29")
+        
+        # Convert from (30, num_samples) to flat array format
         # Same format as generate_data_intan16: [ch0_0, ch0_1, ..., ch0_N, ch1_0, ...]
-        num_channels, num_samples = amplifier_data.shape
-        all_data_16 = np.zeros(num_channels * num_samples, dtype=np.uint16)
+        # Where ch0 is FPGA channel 0 (which is RHD channel 2)
+        all_data_16 = np.zeros(num_fpga_channels * num_samples, dtype=np.uint16)
         
-        for ch in range(num_channels):
-            start_idx = ch * num_samples
+        for fpga_ch in range(num_fpga_channels):
+            rhd_ch = fpga_ch + 2  # FPGA channel 0 = RHD channel 2
+            start_idx = fpga_ch * num_samples
             end_idx = start_idx + num_samples
-            all_data_16[start_idx:end_idx] = amplifier_data[ch, :]
+            all_data_16[start_idx:end_idx] = data_channels[fpga_ch, :]
         
         return all_data_16, num_samples, sample_rate
         
@@ -106,12 +125,18 @@ def generate_synthetic_data_chunks(num_chunks=450, samples_per_channel=60000, se
     return chunks, all_data_16
 
 def generate_chunks_from_data(all_data_16, num_channels, samples_per_channel):
-    """Generate FPGA chunks from loaded data."""
+    """
+    Generate FPGA chunks from loaded data.
+    
+    NOTE: all_data_16 contains data for FPGA channels 0-29 (which are RHD channels 2-31).
+    We only send the actual data channels, not padding to 32.
+    """
     chunks = []
     num_chunks = (samples_per_channel + SAMPLES_PER_CHUNK - 1) // SAMPLES_PER_CHUNK
     
     for chunk_id in range(num_chunks):
         chunk_bytes = bytearray()
+        # Only process the actual data channels (0 to num_channels-1)
         for ch in range(num_channels):
             for sample_in_chunk in range(SAMPLES_PER_CHUNK):
                 sample_idx = chunk_id * SAMPLES_PER_CHUNK + sample_in_chunk
@@ -163,7 +188,7 @@ def parse_seizure_events(output_file):
     
     return seizures
 
-def plot_raw_data(log_base, num_chunks):
+def plot_raw_data(log_base, num_chunks, num_channels=None):
     """Generate plots with seizure regions marked."""
     try:
         import numpy as np
@@ -188,8 +213,14 @@ def plot_raw_data(log_base, num_chunks):
     samples_sent = num_chunks * SAMPLES_PER_CHUNK
     duration_ms = samples_sent  # At 1 kHz: samples = milliseconds
     
-    # Plot all 32 channels in blocks of 4, arranged in 3x3 grid
-    num_blocks = (NUM_CHANNELS + 3) // 4  # 8 blocks for 32 channels
+    # Determine number of channels to plot
+    if num_channels is None:
+        num_channels_plot = len(raw_data) // samples_sent if samples_sent > 0 else NUM_CHANNELS
+    else:
+        num_channels_plot = num_channels
+    
+    # Plot channels in blocks of 4, arranged in 3x3 grid
+    num_blocks = (num_channels_plot + 3) // 4
     fig = plt.figure(figsize=(20, 15))
     gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
     
@@ -199,7 +230,7 @@ def plot_raw_data(log_base, num_chunks):
         
         # Get channels for this block (4 channels per block)
         start_ch = block_idx * 4
-        end_ch = min(start_ch + 4, NUM_CHANNELS)
+        end_ch = min(start_ch + 4, num_channels_plot)
         channels_in_block = list(range(start_ch, end_ch))
         
         # Create subplot grid for this block (4 channels stacked vertically)
@@ -210,7 +241,7 @@ def plot_raw_data(log_base, num_chunks):
             ax_ch = fig.add_subplot(block_gs[ch_idx, 0])
             
             # Calculate start index for this channel
-            channel_start_idx = ch * len(raw_data) // NUM_CHANNELS
+            channel_start_idx = ch * len(raw_data) // num_channels_plot
             # Only plot the samples that were actually sent
             channel_data = raw_data[channel_start_idx:channel_start_idx + samples_sent]
             
@@ -306,7 +337,10 @@ def main():
             if args.chunks:
                 num_chunks = min(num_chunks, args.chunks)  # Limit if specified
             
-            chunks = generate_chunks_from_data(all_data_16, NUM_CHANNELS, samples_per_channel)
+            # all_data_16 contains 30 channels (RHD channels 2-31 mapped to FPGA channels 0-29)
+            # generate_chunks_from_data will pad FPGA channels 30-31 with mid-point values
+            num_data_channels = len(all_data_16) // samples_per_channel
+            chunks = generate_chunks_from_data(all_data_16, num_data_channels, samples_per_channel)
             chunks = chunks[:num_chunks]  # Limit to requested chunks
             
             # Save raw data for visualization
@@ -326,18 +360,25 @@ def main():
             samples_per_channel = args.samples
             log_msg(f"[DATA] Generated {len(chunks)} chunks ({len(chunks) * CHUNK_BYTES} bytes)")
         
-        # Initialize device
+        # Initialize device - try all devices until one works
         dev = ok.okCFrontPanel()
         count = dev.GetDeviceCount()
         if count <= 0:
             log_msg("ERROR: No Opal Kelly devices found.")
             sys.exit(1)
         
-        serial = dev.GetDeviceListSerial(0)
-        rc = dev.OpenBySerial(serial)
-        log_msg(f"[CONNECT] OpenBySerial({serial}) rc={rc}")
-        if rc != ok.okCFrontPanel.NoError:
-            log_msg(f"ERROR: OpenBySerial failed")
+        serial = None
+        for i in range(count):
+            try_serial = dev.GetDeviceListSerial(i)
+            rc = dev.OpenBySerial(try_serial)
+            log_msg(f"[CONNECT] Trying device {i}: Serial {try_serial}, rc={rc}")
+            if rc == ok.okCFrontPanel.NoError:
+                serial = try_serial
+                log_msg(f"[CONNECT] Successfully opened device {i}: {serial}")
+                break
+        
+        if serial is None:
+            log_msg("ERROR: Could not open any Opal Kelly device.")
             sys.exit(1)
         
         # Configure FPGA
@@ -404,16 +445,22 @@ def main():
             
             events_by_channel[channel_id].append((event_code, event_str, timestamp25, w))
         
-        # Write per-channel
+        # Write per-channel (only display data channels, not padded channels)
         log_base = Path(args.log).stem
         outputs_dir = Path("outputs")
         outputs_dir.mkdir(exist_ok=True)
+        
+        # Determine number of data channels (30 for Intan data, 32 for synthetic)
+        if args.data_folder:
+            num_display_channels = num_data_channels  # 30 channels
+        else:
+            num_display_channels = NUM_CHANNELS  # 32 channels for synthetic
         
         log_msg(f"\n" + "=" * 70)
         log_msg("OUTPUT")
         log_msg("=" * 70)
         
-        for ch in range(32):
+        for ch in range(num_display_channels):
             if events_by_channel[ch]:
                 # Count seizures
                 seizure_count = sum(1 for event_code, _, _, _ in events_by_channel[ch] if event_code == 0x1)
@@ -447,7 +494,8 @@ def main():
         # Generate plots
         log_msg(f"\n[PLOT] Generating plots from raw input data...")
         num_chunks_plot = len(chunks)
-        plot_raw_data(log_base, num_chunks_plot)
+        # Pass num_data_channels to plot function if available
+        plot_raw_data(log_base, num_chunks_plot, num_data_channels if args.data_folder else NUM_CHANNELS)
     
     print(f"\nDONE! Log written to {args.log}")
 
