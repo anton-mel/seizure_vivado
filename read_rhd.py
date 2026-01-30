@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
 Read Intan RHD2000 .rhd files.
-Uses Intan's official read_rhd library if available, otherwise implements basic parser.
+Uses Intan's official importrhdutilities.py to read RHD files.
 """
 
 import sys
-import struct
 import numpy as np
 from pathlib import Path
 
-# Try to import Intan's official read_rhd library
+# Import the official Intan RHD loader from root directory
+_rhd_loader_path = Path(__file__).parent / "importrhdutilities.py"
+if not _rhd_loader_path.exists():
+    raise FileNotFoundError(f"Intan RHD loader not found at {_rhd_loader_path}")
+
+# Add the directory to path and import
+sys.path.insert(0, str(_rhd_loader_path.parent))
 try:
-    # Check if IntanRHX app has the library
-    sys.path.insert(0, '/Applications/IntanRHX.app/Contents/Resources')
-    import read_rhd as intan_read_rhd
-    HAS_INTAN_LIB = True
-except ImportError:
-    HAS_INTAN_LIB = False
+    import importrhdutilities as rhd_loader
+except ImportError as e:
+    raise ImportError(f"Failed to import Intan RHD loader: {e}")
 
 def read_rhd_file(rhd_path):
     """
     Read Intan RHD2000 .rhd file and extract amplifier data.
+    
+    Uses the official Intan importrhdutilities.py loader.
     
     Returns:
         dict with keys:
@@ -33,50 +37,33 @@ def read_rhd_file(rhd_path):
     if not rhd_path.exists():
         raise FileNotFoundError(f"RHD file not found: {rhd_path}")
     
-    if HAS_INTAN_LIB and intan_read_rhd:
-        # Use Intan's official library
-        try:
-            # Try different possible function names
-            if hasattr(intan_read_rhd, 'read_file'):
-                result = intan_read_rhd.read_file(str(rhd_path))
-            elif hasattr(intan_read_rhd, 'read_rhd_file'):
-                result = intan_read_rhd.read_rhd_file(str(rhd_path))
-            else:
-                raise AttributeError("No read function found in Intan library")
-            
-            amplifier_data = result['amplifier_data']  # Shape: (num_channels, num_samples)
-            sample_rate = result.get('frequency_parameters', {}).get('amplifier_sample_rate', 20000.0)
-            
-            return {
-                'amplifier_data': amplifier_data,
-                'sample_rate': sample_rate,
-                'num_channels': amplifier_data.shape[0],
-                'num_samples': amplifier_data.shape[1]
-            }
-        except Exception as e:
-            print(f"Warning: Intan library failed: {e}. Trying manual parsing...")
-    
-    # Manual parsing fallback
-    return read_rhd_manual(rhd_path)
-
-def read_rhd_manual(rhd_path):
-    """
-    Manual RHD file parser (fallback if official library not available).
-    This is a simplified parser - may not work for all RHD file versions.
-    """
-    with open(rhd_path, 'rb') as f:
-        # Read magic number
-        magic = struct.unpack('<I', f.read(4))[0]
-        if magic != 0x0D691F3A:
-            raise ValueError(f"Invalid RHD file format. Magic: 0x{magic:08X}")
+    # Use Intan's official loader
+    try:
+        result, data_present = rhd_loader.load_file(str(rhd_path))
         
-        # Read version
-        version = struct.unpack('<H', f.read(2))[0]
+        if not data_present:
+            raise ValueError("RHD file contains no amplifier data")
         
-        # Skip to data section (simplified - actual format is more complex)
-        # For now, raise error suggesting to use IntanRHX export
-        raise NotImplementedError(
-            "Manual RHD parsing not fully implemented. "
-            "Please use IntanRHX software to export data to a compatible format, "
-            "or ensure Intan's read_rhd library is available."
-        )
+        # Extract amplifier data from result dict
+        # The data is already in volts, but we need ADC codes
+        # According to importrhdutilities.py line 1074-1075:
+        # voltage = 0.195 * (adc_code - 32768)
+        # So: adc_code = (voltage / 0.195) + 32768
+        
+        amplifier_data_volts = result['amplifier_data']  # Shape: (num_channels, num_samples) in Volts
+        
+        # Convert back to ADC codes (uint16)
+        amplifier_data_adc = np.round((amplifier_data_volts / 0.195) + 32768).astype(np.uint16)
+        
+        # Get sample rate
+        sample_rate = result.get('sample_rate', 20000.0)
+        
+        return {
+            'amplifier_data': amplifier_data_adc,
+            'sample_rate': sample_rate,
+            'num_channels': amplifier_data_adc.shape[0],
+            'num_samples': amplifier_data_adc.shape[1]
+        }
+            
+    except Exception as e:
+        raise RuntimeError(f"Failed to read RHD file: {e}")
