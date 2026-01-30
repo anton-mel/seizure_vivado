@@ -202,7 +202,7 @@ def main():
     p.add_argument("--chunks", type=int, default=469, help="Number of chunks (default: 469)")
     p.add_argument("--samples", type=int, default=60000, help="Samples per channel (default: 60000)")
     # Datapath Configuration Parameters
-    p.add_argument("--threshold", type=int, default=150000, help="NEO threshold (default: 150000)")
+    p.add_argument("--threshold", type=int, default=170000, help="NEO threshold (default: 150000)")
     p.add_argument("--window-timeout", type=int, default=300, help="Window timeout in samples (default: 300)")
     p.add_argument("--transition-count", type=int, default=50, help="Detections needed to start seizure (default: 50)")
     # Logging
